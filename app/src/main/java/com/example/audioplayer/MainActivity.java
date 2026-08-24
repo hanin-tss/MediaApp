@@ -1,6 +1,7 @@
 package com.example.audioplayer;
 
 import android.Manifest;
+import android.content.ComponentName;
 import android.content.ContentUris;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
@@ -13,6 +14,10 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.provider.MediaStore;
+import android.support.v4.media.MediaBrowserCompat;
+import android.support.v4.media.MediaMetadataCompat;
+import android.support.v4.media.session.MediaControllerCompat;
+import android.support.v4.media.session.PlaybackStateCompat;
 import android.widget.Button;
 import android.widget.ImageButton;
 import android.widget.ImageView;
@@ -23,21 +28,86 @@ import android.widget.Toast;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
+import androidx.recyclerview.widget.LinearLayoutManager;
+import androidx.recyclerview.widget.RecyclerView;
 
 import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
 
 public class MainActivity extends AppCompatActivity {
 
-    private MediaPlayer mediaPlayer;
+    private RecyclerView recyclerView;
+    private SongAdapter adapter;
+    private MediaBrowserCompat mediaBrowser;
+    private MediaControllerCompat mediaController;
     private ImageButton btnNext, btnPrevious, btnPlay, btnPause;
     private TextView currentPlayTime, totalPlayTime, audioTitle;
     private ImageView albumArt;
     private SeekBar seekBar;
-    private Handler handler = new Handler();
     private Runnable updateSeekbar;
-    private ArrayList playList = new ArrayList<>();
-    private int currentIndex = 0;
+    private Handler handler = new Handler();
+
     private static final int PERMISSION_REQUEST_CODE = 123;
+
+    private final MediaBrowserCompat.ConnectionCallback connectionCallBacks =
+            new MediaBrowserCompat.ConnectionCallback() {
+                @Override
+                public void onConnected() {
+                    // Connection successful, getting session token from service
+                    mediaController = new MediaControllerCompat(MainActivity.this, mediaBrowser.getSessionToken());
+
+                    // Registering the Controller with Activity
+                    MediaControllerCompat.setMediaController(MainActivity.this, mediaController);
+
+                    mediaController.registerCallback(controllerCallback);
+                    // Add this right after you register the controllerCallback:
+                    mediaBrowser.subscribe(mediaBrowser.getRoot(), subscriptionCallback);
+
+                    controllerCallback.onMetadataChanged(mediaController.getMetadata());
+                    controllerCallback.onPlaybackStateChanged(mediaController.getPlaybackState());
+                }
+
+            };
+
+    private final MediaControllerCompat.Callback controllerCallback =
+            new MediaControllerCompat.Callback() {
+                @Override
+                public void onMetadataChanged(MediaMetadataCompat metadata) {
+                    if (metadata == null) return;
+
+                    audioTitle.setText(metadata.getString(MediaMetadataCompat.METADATA_KEY_TITLE));
+
+                    Bitmap art = metadata.getBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART);
+                    if (art != null) {
+                        albumArt.setImageBitmap(art);
+                    } else {
+                        albumArt.setImageDrawable(null);
+                    }
+
+                    long duration = metadata.getLong(MediaMetadataCompat.METADATA_KEY_DURATION);
+                    seekBar.setMax((int) duration);
+                    totalPlayTime.setText(formatTime((int) duration));
+                }
+
+                @Override
+                public void onPlaybackStateChanged(PlaybackStateCompat state){
+                    if(state == null) return;
+
+                    seekBar.setProgress((int) state.getPosition());
+                    currentPlayTime.setText(formatTime((int) state.getPosition()));
+                }
+
+            };
+
+    private final MediaBrowserCompat.SubscriptionCallback subscriptionCallback =
+            new MediaBrowserCompat.SubscriptionCallback() {
+                @Override
+                public void onChildrenLoaded(String parentId, List<MediaBrowserCompat.MediaItem> children) {
+                    // We got the list from AudioPlayerService! Send it to the RecyclerView.
+                    adapter.submitList(children);
+                }
+            };
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
@@ -54,21 +124,28 @@ public class MainActivity extends AppCompatActivity {
         albumArt = findViewById(R.id.ivAlbumArt);
         audioTitle = findViewById(R.id.tvSongTitle);
 
+        mediaBrowser = new MediaBrowserCompat(this,
+                new ComponentName(this, AudioPlayerService.class),
+                connectionCallBacks,
+                null);
+
         // Background task to update seek bar
         updateSeekbar = new Runnable() {
             @Override
             public void run() {
-                if(mediaPlayer != null && mediaPlayer.isPlaying()){
-                    seekBar.setProgress(mediaPlayer.getCurrentPosition());
+                if (mediaController != null && mediaController.getPlaybackState() != null) {
 
-                    // get current played time
-                    int timeInMilli = mediaPlayer.getCurrentPosition();
-                    int minutes = (timeInMilli / 1000) / 60;
-                    int seconds = (timeInMilli / 1000) % 60;
-                    String playedTime = String.format("%02d:%02d", minutes, seconds);
-                    currentPlayTime.setText(playedTime);
+                    // Only update the UI if the background engine is currently PLAYING
+                    if (mediaController.getPlaybackState().getState() == PlaybackStateCompat.STATE_PLAYING) {
+
+                        // Ask the universal remote for the current exact timestamp
+                        long currentPosition = mediaController.getPlaybackState().getPosition();
+
+                        seekBar.setProgress((int) currentPosition);
+                        currentPlayTime.setText(formatTime((int) currentPosition));
+                    }
                 }
-
+                // Run this loop again in 1 second
                 handler.postDelayed(this, 1000);
             }
         };
@@ -76,178 +153,112 @@ public class MainActivity extends AppCompatActivity {
         seekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                if (fromUser && mediaPlayer != null) {
-                    mediaPlayer.seekTo(progress); // Jump to the dragged position
+                if (fromUser && mediaController != null) {
+                    mediaController.getTransportControls().seekTo(progress);
                 }
             }
             @Override
-            public void onStartTrackingTouch(SeekBar seekBar) {
-                handler.removeCallbacks(updateSeekbar);
-            }
+            public void onStartTrackingTouch(SeekBar seekBar) {}
             @Override
-            public void onStopTrackingTouch(SeekBar seekBar) {
-                handler.postDelayed(updateSeekbar, 0);
-            }
+            public void onStopTrackingTouch(SeekBar seekBar) {}
         });
 
         // Play Button logic
         btnPlay.setOnClickListener(v -> {
-            if (mediaPlayer == null) {
-                playSong(currentIndex);
-            }
-
-            if (!mediaPlayer.isPlaying()) {
-                mediaPlayer.start();
-                handler.postDelayed(updateSeekbar, 1000);
+            if (mediaController != null) {
+                mediaController.getTransportControls().play();
             }
         });
 
         // Pause Button logic
         btnPause.setOnClickListener(v -> {
-            if (mediaPlayer != null) {
-                if (mediaPlayer.isPlaying()) {
-                    mediaPlayer.pause();
-                }
+            if(mediaController != null){
+                mediaController.getTransportControls().pause();
             }
         });
 
         // Previous button logic
         btnPrevious.setOnClickListener(v -> {
-            currentIndex = (currentIndex - 1 + playList.size()) % playList.size();
-            playSong(currentIndex);
+            if (mediaController != null) {
+                mediaController.getTransportControls().skipToPrevious();
+            }
         });
 
         // Next button
         btnNext.setOnClickListener(v -> {
-            currentIndex = (currentIndex + 1) % playList.size();
-            playSong(currentIndex);
+            if (mediaController != null) {
+                mediaController.getTransportControls().skipToNext();
+            }
         });
 
+        recyclerView = findViewById(R.id.recyclerView);
+        recyclerView.setLayoutManager(new LinearLayoutManager(this));
+
+// When a song is clicked, send the Play command to the Service using its Media ID
+        adapter = new SongAdapter(item -> {
+            if (mediaController != null) {
+                mediaController.getTransportControls().playFromMediaId(item.getMediaId(), null);
+            }
+        });
+        recyclerView.setAdapter(adapter);
+
         requestStoragePermission();
+        handler.post(updateSeekbar);
     }
 
-    private void requestStoragePermission(){
+    @Override
+    public void onStart() {
+        super.onStart();
+
+        if (!mediaBrowser.isConnected()) {
+            mediaBrowser.connect();
+        }
+    }
+
+    private void requestStoragePermission() {
         String permission = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
                 ? Manifest.permission.READ_MEDIA_AUDIO
                 : Manifest.permission.READ_EXTERNAL_STORAGE;
 
-        if (ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED) {
-            loadAudioFiles();
-        } else {
+        if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(this, new String[]{permission}, PERMISSION_REQUEST_CODE);
         }
     }
 
     @Override
-    public void onRequestPermissionsResult(
-            int requestCode,
-            String[] permissions,
-            int[] grantResults) {
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if(requestCode == PERMISSION_REQUEST_CODE && grantResults.length > 0 &&
-                grantResults[0] == PackageManager.PERMISSION_GRANTED){
-            loadAudioFiles();
-        }else{
-            Toast.makeText(this, "Permisson denied, cannot load songs",
-                    Toast.LENGTH_LONG).show();
-        }
-    }
 
-    private void loadAudioFiles(){
-        Uri collection = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
-                ? MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
-                : MediaStore.Audio.Media.EXTERNAL_CONTENT_URI;
-        String[] projection = new String[] { MediaStore.Audio.Media._ID };
-        String selection = MediaStore.Audio.Media.IS_MUSIC + " != 0";
-        try (Cursor cursor = getContentResolver().query(collection, projection, selection, null, null)) {
-            if (cursor != null) {
-                int idColumn = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media._ID);
-                while (cursor.moveToNext()) {
-                    long id = cursor.getLong(idColumn);
-                    Uri contentUri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id);
-                    playList.add(contentUri);
-                }
-            }
-        }
+        if (requestCode == PERMISSION_REQUEST_CODE && grantResults.length > 0 &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED) {
 
-        if (playList.isEmpty()) {
-            Toast.makeText(this, "No MP3 files found on your device", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "Permission granted. Press Play!", Toast.LENGTH_SHORT).show();
+
         } else {
-            Toast.makeText(this, "Loaded " + playList.size() + " songs!", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "Permission denied, cannot load songs", Toast.LENGTH_LONG).show();
         }
     }
+
 
     @Override
     public void onStop() {
         super.onStop();
-        if(mediaPlayer != null && mediaPlayer.isPlaying()){
-            mediaPlayer.pause();
-        }
 
-        handler.removeCallbacks(updateSeekbar);
+        if (mediaBrowser.isConnected()) {
+            mediaBrowser.disconnect();
+        }
     }
 
     @Override
-    public void onDestroy(){
+    public void onDestroy() {
         super.onDestroy();
         handler.removeCallbacks(updateSeekbar);
-        if(mediaPlayer != null){
-            mediaPlayer.release();
-            mediaPlayer = null;
-        }
+
     }
 
-    private void playSong(int index){
-
-        if(mediaPlayer != null){
-            mediaPlayer.release();
-        }
-
-        Uri songUri = (Uri) playList.get(index);
-        mediaPlayer = MediaPlayer.create(this, songUri);
-        if(mediaPlayer == null) return;
-        mediaPlayer.start();
-
-        seekBar.setMax(mediaPlayer.getDuration());
-
-        // Getting the total duration
-        int durationInMilliseconds = mediaPlayer.getDuration();
-        int minutes = (durationInMilliseconds / 1000) / 60;
-        int seconds = (durationInMilliseconds / 1000) %60;
-        String totalTime = String.format("%02d:%02d", minutes, seconds);
-        totalPlayTime.setText(totalTime);
-
-        updateTrackInfo(songUri);
-
-        handler.removeCallbacks(updateSeekbar);
-        handler.postDelayed(updateSeekbar, 0);
-    }
-
-    private void updateTrackInfo(Uri mediaUri){
-
-        MediaMetadataRetriever retriever = new MediaMetadataRetriever();
-        retriever.setDataSource(this, mediaUri);
-
-        byte[] art = retriever.getEmbeddedPicture();
-        if (art != null) {
-            Bitmap bitmap = BitmapFactory.decodeByteArray(art, 0, art.length);
-            albumArt.setImageBitmap(bitmap);
-        } else {
-            albumArt.setImageDrawable(null);
-        }
-
-        String title = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE);
-        if (title != null) {
-            audioTitle.setText(title);
-        } else {
-            // Fallback if no ID3 tag exists
-            audioTitle.setText("Unknown Track");
-        }
-
-        try {
-            retriever.release();
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
+    private String formatTime(int milliseconds) {
+        int seconds = (milliseconds / 1000) % 60;
+        int minutes = (milliseconds / (1000 * 60)) % 60;
+        return String.format(Locale.getDefault(), "%02d:%02d", minutes, seconds);
     }
 }
